@@ -1,0 +1,6 @@
+growwapi
+pyotp
+pandas
+numpy
+pyarrow
+python-dotenv
