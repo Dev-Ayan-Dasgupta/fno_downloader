@@ -22,7 +22,11 @@ def _tm(s):
 
 
 def select_contract(sig, ctx, store, p):
-    """Nearest expiry with >= roll_days left; ATM and the strikes either side; delta in band; closest to 0.50."""
+    """Select contract using a synchronized post-signal execution snapshot.
+
+    next_open: signal is known at T; enter at the next 1m candle open (T + 1 minute).
+    legacy_close: retain the old close-at-T convention for comparison only.
+    """
     day, T, typ = sig["day"], sig["T"], sig["direction"]
     liq = ctx.liq.get(day, np.nan)
     if not (liq >= 0.8):
@@ -31,9 +35,24 @@ def select_contract(sig, ctx, store, p):
     exp = next((e for e in store.expiries if (e - day).days >= p.roll_days), None)
     if exp is None:
         return None, "no_expiry"
-    spot = ctx.m1c.get(T, np.nan)
-    if spot != spot:
-        return None, "no_spot_candle"
+    if p.execution_mode == "next_open":
+        entry_ts = T + pd.Timedelta(minutes=1)
+        price_ts = entry_ts
+        spot_rows = ctx.m1_by_day[day]
+        spot_rows = spot_rows[spot_rows["ts"] == entry_ts]
+        if spot_rows.empty:
+            return None, "no_next_minute_spot"
+        spot, price_col = float(spot_rows["o"].iloc[0]), "o"
+    elif p.execution_mode == "legacy_close":
+        # The old candle is timestamped at its start T; its close is only known at T+1.
+        price_ts = T
+        entry_ts = T + pd.Timedelta(minutes=1)
+        spot = float(ctx.m1c.get(T, np.nan))
+        if not np.isfinite(spot):
+            return None, "no_spot_candle"
+        price_col = "c"
+    else:
+        return None, f"unknown_execution_mode:{p.execution_mode}"
     strikes = store.strikes.get((exp, typ), [])
     if not strikes:
         return None, "no_strikes"
@@ -50,17 +69,17 @@ def select_contract(sig, ctx, store, p):
         if not store.has(cname, day):
             store.ensure(cname, [day])
         rows = store.get(cname, day)
-        row = rows[rows["ts"] == T]
+        row = rows[rows["ts"] == price_ts]
         if row.empty:
             why["no_entry_candle"] = why.get("no_entry_candle", 0) + 1
             continue
-        price = float(row["c"].iloc[0])
-        if price < p.min_premium:
+        price = float(row[price_col].iloc[0])
+        if not np.isfinite(price) or price < p.min_premium:
             why["min_premium"] = why.get("min_premium", 0) + 1
             continue
-        Ty = P.time_to_expiry(T + pd.Timedelta(minutes=1), exp)
+        Ty = P.time_to_expiry(entry_ts, exp)
         iv = P.implied_vol(price, spot, K, Ty, typ)
-        if iv != iv:
+        if not np.isfinite(iv):
             why["iv_nan"] = why.get("iv_nan", 0) + 1
             continue
         dl = P.delta(spot, K, Ty, iv, typ)
@@ -69,7 +88,9 @@ def select_contract(sig, ctx, store, p):
             continue
         score = abs(abs(dl) - 0.5)
         if best is None or score < best["score"]:
-            best = dict(contract=cname, expiry=exp, strike=K, price=price, iv=iv, delta=dl, Ty=Ty, spot=spot, score=score)
+            best = dict(contract=cname, expiry=exp, strike=K, price=price, iv=iv,
+                        delta=dl, Ty=Ty, spot=spot, score=score, entry_ts=entry_ts,
+                        price_field=price_col)
     if best is None:
         return None, "no_eligible_contract:" + ",".join(f"{k}={v}" for k, v in sorted(why.items()))
     return best, ""
@@ -109,24 +130,32 @@ def make_levels(sig, sel, ctx, p, stop_mult):
     px = lambda L: P.bs_price(L, sel["strike"], sel["Ty"], sel["iv"], side)
     entry = sel["price"]
     stop = _r(px(stop_u))
-    tg = [_r(px(spot + sign * k * Ru)) for k in (1, 2, 3, 4)]
+    ks = (1, 2) if p.exit_scheme == "t1t2" else (1, 2, 3, 4)
+    nan = float("nan")
+    tg = [_r(px(spot + sign * k * Ru)) for k in ks] + [nan] * (4 - len(ks))
+    tg_u = [spot + sign * k * Ru for k in ks] + [nan] * (4 - len(ks))
     risk = entry - stop
     if stop <= 0 or risk <= 0:
         return None, "bad_stop_price"
     if risk / entry > p.max_stop_frac:
         return None, "stop_over_cap"
-    if not (tg[0] < tg[1] < tg[2] < tg[3]):
+    if not all(tg[i] < tg[i + 1] for i in range(len(ks) - 1)):
         return None, "targets_not_increasing"
     if (tg[1] - entry) / risk < p.min_rr_t2:
         return None, "rr_t2"
-    return dict(stop_u=stop_u, Ru=Ru, tg_u=[spot + sign * k * Ru for k in (1, 2, 3, 4)], entry=entry,
-                stop=stop, tg=tg, risk=risk), ""
+    return dict(stop_u=stop_u, Ru=Ru, tg_u=tg_u, entry=entry, stop=stop, tg=tg, risk=risk), ""
 
 
-def simulate(entry, stop0, tg, ts, o, h, l, c, variant, eod_ts):
-    """1-minute walk after entry. Stop is checked first (stop wins ties); gaps fill at the candle open; a target
-    counts only if the high exceeds it by one tick. Booking 50/25/25 at T2/T3/T4; T1 is never booked.
-    Variant A: T1 -> stop to entry, T2 -> T1, T3 -> T2.  Variant B: stop unchanged until T2, then T1, then T2."""
+def simulate(entry, stop0, tg, ts, o, h, l, c, variant, eod_ts,
+            intrabar_mode="conservative", scheme="t4"):
+    """Walk 1m option candles from entry onward.
+
+    conservative: a stop activated by a target inside a candle is assumed hit if that
+    candle's low crosses it. optimistic: newly activated stops apply from next candle.
+    Initial stop wins same-candle ties in both modes.
+    """
+    if intrabar_mode not in ("conservative", "optimistic"):
+        raise ValueError(f"Unknown intrabar_mode: {intrabar_mode}")
     stop, remaining = stop0, 1.0
     legs, hit = [], [False] * 4
     min_low = max_high = entry
@@ -140,20 +169,28 @@ def simulate(entry, stop0, tg, ts, o, h, l, c, variant, eod_ts):
             legs.append(("SL" if stop <= stop0 + 1e-9 else "TRAIL", min(stop, o[i]), remaining))
             remaining = 0.0
             break
-        for k in range(4):
+        for k in range(2 if scheme == "t1t2" else 4):
             if hit[k]:
                 continue
-            if h[i] >= tg[k] + TICK:
-                hit[k] = True
+            if h[i] < tg[k] + TICK:
+                break
+            hit[k] = True
+            if scheme == "t1t2":
+                legs.append((f"T{k + 1}", tg[k], 0.5))      # 50% at T1, then the stop moves to entry; 50% at T2
+                remaining -= 0.5
                 if k == 0:
-                    if variant == "A":
-                        stop = max(stop, entry)
-                else:
-                    frac = (0.5, 0.25, 0.25)[k - 1]
-                    legs.append((f"T{k + 1}", tg[k], frac))
-                    remaining -= frac
-                    stop = max(stop, tg[k - 1])
+                    stop = max(stop, entry)
+            elif k == 0:
+                if variant == "A":
+                    stop = max(stop, entry)
             else:
+                frac = (0.5, 0.25, 0.25)[k - 1]
+                legs.append((f"T{k + 1}", tg[k], frac))
+                remaining -= frac
+                stop = max(stop, tg[k - 1])
+            if intrabar_mode == "conservative" and remaining > 1e-9 and l[i] <= stop:
+                legs.append(("TRAIL" if stop > stop0 + 1e-9 else "SL", min(stop, o[i]), remaining))
+                remaining = 0.0
                 break
         if remaining <= 1e-9:
             remaining = 0.0
@@ -163,33 +200,39 @@ def simulate(entry, stop0, tg, ts, o, h, l, c, variant, eod_ts):
             legs.append(("EOD_NOCANDLE", entry, remaining))
         else:
             legs.append(("EOD", float(c[last]), remaining))
-    return dict(legs=legs, mae_px=entry - min_low, mfe_px=max_high - entry, hit=hit, stale=(last is None))
+    return dict(legs=legs, mae_px=entry - min_low, mfe_px=max_high - entry,
+                hit=hit, stale=(last is None))
 
 
-def underlying_outcome(sig, lv, ctx, eod_t):
-    """What the stock itself did after entry: highest target reached before the stop, and whether it reached the T2
-    level at any time before the end of the day (used to judge stops that were too tight)."""
+def underlying_outcome(sig, lv, ctx, eod_t, entry_ts=None):
+    """Separate T2 reached at any time from T2 reached before the underlying stop.
+
+    Same-minute target/stop touches are ambiguous and are treated conservatively:
+    T2 does not count as preceding the stop when both occur in one 1m candle.
+    """
+    entry_ts = entry_ts if entry_ts is not None else sig["T"]
     m1 = ctx.m1_by_day[sig["day"]]
-    w = m1[(m1["ts"] >= sig["T"]) & (m1["ts"].dt.time <= eod_t)]
+    w = m1[(m1["ts"] >= entry_ts) & (m1["ts"].dt.time <= eod_t)]
     if w.empty:
-        return "none", False
+        return dict(outcome="none", reach_t2_any=False, reach_t2_before_stop=False,
+                    stop_hit=False)
     h, l = w["h"].to_numpy(), w["l"].to_numpy()
     long_ = sig["direction"] == "CE"
-    stop_hit = np.flatnonzero(l <= lv["stop_u"]) if long_ else np.flatnonzero(h >= lv["stop_u"])
-    s_i = int(stop_hit[0]) if stop_hit.size else len(h)
-    best = 0
-    reach_any = False
-    for k, L in enumerate(lv["tg_u"], start=1):
-        idx = np.flatnonzero(h >= L) if long_ else np.flatnonzero(l <= L)
-        if idx.size:
-            if k == 2:
-                reach_any = True
-            if idx[0] < s_i:
-                best = k
-    label = f"T{best}" if best else ("SL" if stop_hit.size else "EOD")
-    if best and stop_hit.size:
+    stop_idx = np.flatnonzero(l <= lv["stop_u"]) if long_ else np.flatnonzero(h >= lv["stop_u"])
+    stop_i = int(stop_idx[0]) if stop_idx.size else len(h)
+    target_idx = []
+    for level in lv["tg_u"]:
+        idx = np.flatnonzero(h >= level) if long_ else np.flatnonzero(l <= level)
+        target_idx.append(int(idx[0]) if idx.size else None)
+    reach_any = target_idx[1] is not None
+    reach_before = reach_any and target_idx[1] < stop_i
+    best = max((k for k, idx in enumerate(target_idx, start=1)
+                if idx is not None and idx < stop_i), default=0)
+    label = f"T{best}" if best else ("SL" if stop_idx.size else "EOD")
+    if best and stop_idx.size:
         label += "_then_SL"
-    return label, reach_any
+    return dict(outcome=label, reach_t2_any=reach_any,
+                reach_t2_before_stop=reach_before, stop_hit=bool(stop_idx.size))
 
 
 def finalize(sig, sel, lv, sim, p, lot_size):
@@ -214,4 +257,5 @@ def finalize(sig, sel, lv, sim, p, lot_size):
                 risk_rs=round(risk_rs, 2), r_gross=round(gross / risk_rs, 3), r_net=round((gross - cost) / risk_rs, 3),
                 mae_r=round(sim["mae_px"] / lv["risk"], 3), mfe_r=round(sim["mfe_px"] / lv["risk"], 3),
                 hit_t1=sim["hit"][0], hit_t2=sim["hit"][1], hit_t3=sim["hit"][2], hit_t4=sim["hit"][3],
-                stale=sim["stale"])
+                stale=sim["stale"], execution_mode=p.execution_mode, exit_scheme=p.exit_scheme,
+                intrabar_mode=p.intrabar_mode, entry_ts=sel.get("entry_ts"))
